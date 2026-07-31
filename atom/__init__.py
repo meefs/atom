@@ -2,7 +2,13 @@
 
 from .propagation import WavePropagator, gaussian_field, intensity
 from .diffractive import DiffractiveLayer, DiffractiveNetwork
-from .noise import quantize_phase
+from .noise import (
+    quantize_phase,
+    add_phase_noise,
+    add_angular_jitter,
+    apply_crosstalk,
+    NoiseConfig,
+)
 from .attention import (
     optical_scores,
     optical_scores_general,
@@ -18,6 +24,10 @@ __all__ = [
     "DiffractiveLayer",
     "DiffractiveNetwork",
     "quantize_phase",
+    "add_phase_noise",
+    "add_angular_jitter",
+    "apply_crosstalk",
+    "NoiseConfig",
     "optical_scores",
     "optical_scores_general",
     "encode_signed_values",

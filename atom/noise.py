@@ -6,11 +6,17 @@ the continuous-phase math works in the ideal case (see attention.py):
 a real crystal can't write an infinite-precision phase angle. It writes
 theta to some finite number of bits. This module answers "how many bits
 before that actually matters."
+
+Extended with:
+- Additive Gaussian phase noise (write / SLM temporal instability)
+- Angular (Bragg) position jitter
+- Soft inter-channel crosstalk on attention scores
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -35,3 +41,80 @@ def quantize_phase(phase: torch.Tensor, bits: int) -> torch.Tensor:
     # is the same physical angle as 0 but a distinct float value -- wrap
     # again so that boundary collapses to the single level it actually is.
     return torch.remainder(quantized, 2 * math.pi)
+
+
+def add_phase_noise(phase: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Add independent Gaussian phase jitter (radians).
+
+    Models write-precision noise, SLM temporal instability, or residual
+    phase error after calibration. sigma is the standard deviation in
+    radians. sigma=0 is a no-op.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if sigma == 0:
+        return phase
+    noise = torch.randn_like(phase) * sigma
+    return phase + noise
+
+
+def add_angular_jitter(positions: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Add Gaussian jitter to angular / Bragg positions.
+
+    Models thermal drift or mechanical instability of the incidence angle.
+    sigma is in the same units as `positions` (radians or arbitrary angle
+    units used by the caller). sigma=0 is a no-op.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if sigma == 0:
+        return positions
+    return positions + torch.randn_like(positions) * sigma
+
+
+def apply_crosstalk(
+    scores: torch.Tensor,
+    strength: float,
+    kernel_size: int = 3,
+) -> torch.Tensor:
+    """Apply soft leakage between neighbouring angular channels.
+
+    `scores` has shape (..., query_seq, key_seq). Crosstalk mixes along
+    the key dimension (the angular-multiplexed axis). `strength` in [0, 1]
+    controls how much of the local neighbourhood leaks in
+    (0 = pure, 1 = fully averaged over the kernel).
+
+    Uses a simple box / uniform kernel for now; can be replaced with a
+    measured Bragg selectivity curve later.
+    """
+    if strength < 0 or strength > 1:
+        raise ValueError("strength must be in [0, 1]")
+    if strength == 0 or kernel_size <= 1:
+        return scores
+    if kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be odd")
+
+    pad = kernel_size // 2
+    # scores: (..., Q, K)
+    padded = torch.nn.functional.pad(scores, (pad, pad), mode="replicate")
+    mixed = torch.zeros_like(scores)
+    for i in range(kernel_size):
+        mixed = mixed + padded[..., i : i + scores.shape[-1]]
+    mixed = mixed / kernel_size
+
+    return (1.0 - strength) * scores + strength * mixed
+
+
+@dataclass
+class NoiseConfig:
+    """Bundle of optional noise parameters.
+
+    All fields default to "ideal / off". Pass this (or individual kwargs)
+    into the optical score functions.
+    """
+
+    phase_bits: int | None = None
+    phase_sigma: float = 0.0
+    angular_jitter: float = 0.0
+    crosstalk: float = 0.0
+    crosstalk_kernel: int = 3
