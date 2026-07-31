@@ -7,10 +7,8 @@ a real crystal can't write an infinite-precision phase angle. It writes
 theta to some finite number of bits. This module answers "how many bits
 before that actually matters."
 
-Extended with:
-- Additive Gaussian phase noise (write / SLM temporal instability)
-- Angular (Bragg) position jitter
-- Soft inter-channel crosstalk on attention scores
+Also covers Gaussian phase noise, angular (Bragg) position jitter, and
+soft inter-channel crosstalk on attention scores.
 """
 
 from __future__ import annotations
@@ -44,26 +42,23 @@ def quantize_phase(phase: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def add_phase_noise(phase: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Add independent Gaussian phase jitter (radians).
+    """Add independent Gaussian phase jitter in radians.
 
-    Models write-precision noise, SLM temporal instability, or residual
-    phase error after calibration. sigma is the standard deviation in
-    radians. sigma=0 is a no-op.
+    Covers write noise, residual SLM error, or uncorrected phase drift.
+    sigma is the standard deviation. sigma=0 is a no-op.
     """
     if sigma < 0:
         raise ValueError("sigma must be non-negative")
     if sigma == 0:
         return phase
-    noise = torch.randn_like(phase) * sigma
-    return phase + noise
+    return phase + torch.randn_like(phase) * sigma
 
 
 def add_angular_jitter(positions: torch.Tensor, sigma: float) -> torch.Tensor:
     """Add Gaussian jitter to angular / Bragg positions.
 
-    Models thermal drift or mechanical instability of the incidence angle.
-    sigma is in the same units as `positions` (radians or arbitrary angle
-    units used by the caller). sigma=0 is a no-op.
+    Models thermal or mechanical drift of the incidence angle.
+    sigma uses the same units as `positions`. sigma=0 is a no-op.
     """
     if sigma < 0:
         raise ValueError("sigma must be non-negative")
@@ -77,15 +72,14 @@ def apply_crosstalk(
     strength: float,
     kernel_size: int = 3,
 ) -> torch.Tensor:
-    """Apply soft leakage between neighbouring angular channels.
+    """Soft leakage between neighbouring angular channels.
 
-    `scores` has shape (..., query_seq, key_seq). Crosstalk mixes along
-    the key dimension (the angular-multiplexed axis). `strength` in [0, 1]
-    controls how much of the local neighbourhood leaks in
-    (0 = pure, 1 = fully averaged over the kernel).
+    `scores` shape is (..., query_seq, key_seq). Mixing happens along the
+    key (angular) axis. `strength` in [0, 1] sets how much of the local
+    neighbourhood is blended in (0 = none, 1 = full average over the kernel).
 
-    Uses a simple box / uniform kernel for now; can be replaced with a
-    measured Bragg selectivity curve later.
+    Uses a uniform box kernel for now. A measured Bragg selectivity curve
+    can replace it later without changing the call signature.
     """
     if strength < 0 or strength > 1:
         raise ValueError("strength must be in [0, 1]")
@@ -95,7 +89,6 @@ def apply_crosstalk(
         raise ValueError("kernel_size must be odd")
 
     pad = kernel_size // 2
-    # scores: (..., Q, K)
     padded = torch.nn.functional.pad(scores, (pad, pad), mode="replicate")
     mixed = torch.zeros_like(scores)
     for i in range(kernel_size):
@@ -107,10 +100,9 @@ def apply_crosstalk(
 
 @dataclass
 class NoiseConfig:
-    """Bundle of optional noise parameters.
+    """Optional noise parameters, all defaulting to ideal / off.
 
-    All fields default to "ideal / off". Pass this (or individual kwargs)
-    into the optical score functions.
+    Pass this (or the individual kwargs) into the optical score functions.
     """
 
     phase_bits: int | None = None

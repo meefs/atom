@@ -62,8 +62,7 @@ def encode_angular_phase(
     matching the ideal theoretical case tested elsewhere.
 
     `phase_sigma` adds independent Gaussian phase jitter (radians) after
-    any quantization. Models write noise or residual phase error.
-    Default 0.0 leaves the phase unchanged.
+    any quantization. Default 0.0 leaves phase unchanged.
 
     IMPORTANT: this phase only produces genuine interference when
     query and key tokens carry *different* positions -- if both sides
@@ -155,11 +154,11 @@ def optical_scores_general(
     are given; the plain binary case (`encode_signed_values`) is
     already exactly two phase levels by construction.
 
-    Additional optional noise knobs (all default to ideal / off):
-    - `phase_sigma`: Gaussian phase jitter after quantization
-    - `angular_jitter`: Gaussian jitter on the position / Bragg angles
-    - `crosstalk`: soft leakage between neighbouring angular channels
-    - `noise`: optional NoiseConfig that overrides the individual knobs
+    Optional noise (all default to ideal / off):
+    - phase_sigma: Gaussian phase jitter after quantization
+    - angular_jitter: Gaussian jitter on position / Bragg angles
+    - crosstalk: soft leakage between neighbouring angular channels
+    - noise: NoiseConfig that overrides the individual knobs
 
     Query and key positions must differ for the effect to show up:
     identical positions on both sides cancel in
