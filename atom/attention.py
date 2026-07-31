@@ -8,7 +8,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .noise import quantize_phase
+from .noise import (
+    quantize_phase,
+    add_phase_noise,
+    add_angular_jitter,
+    apply_crosstalk,
+    NoiseConfig,
+)
 
 
 def encode_signed_values(values: torch.Tensor) -> torch.Tensor:
@@ -37,6 +43,7 @@ def encode_angular_phase(
     positions: torch.Tensor,
     base: float = 10000.0,
     phase_bits: int | None = None,
+    phase_sigma: float = 0.0,
 ) -> torch.Tensor:
     """Encode values as waves with a genuine continuous phase.
 
@@ -53,6 +60,9 @@ def encode_angular_phase(
     address `2**phase_bits` discrete phase levels, instead of an
     idealized continuous angle. `None` (default) keeps phase exact,
     matching the ideal theoretical case tested elsewhere.
+
+    `phase_sigma` adds independent Gaussian phase jitter (radians) after
+    any quantization. Default 0.0 leaves phase unchanged.
 
     IMPORTANT: this phase only produces genuine interference when
     query and key tokens carry *different* positions -- if both sides
@@ -76,6 +86,8 @@ def encode_angular_phase(
     total_phase = sign_phase + angular_phase
     if phase_bits is not None:
         total_phase = quantize_phase(total_phase, phase_bits)
+    if phase_sigma > 0:
+        total_phase = add_phase_noise(total_phase, phase_sigma)
     return amplitude * torch.exp(1j * total_phase)
 
 
@@ -118,6 +130,11 @@ def optical_scores_general(
     key_positions: torch.Tensor | None = None,
     normalize: bool = False,
     phase_bits: int | None = None,
+    phase_sigma: float = 0.0,
+    angular_jitter: float = 0.0,
+    crosstalk: float = 0.0,
+    crosstalk_kernel: int = 3,
+    noise: NoiseConfig | None = None,
 ) -> torch.Tensor:
     """Attention scores from interference with genuine continuous phase.
 
@@ -137,11 +154,24 @@ def optical_scores_general(
     are given; the plain binary case (`encode_signed_values`) is
     already exactly two phase levels by construction.
 
+    Optional noise (all default to ideal / off):
+    - phase_sigma: Gaussian phase jitter after quantization
+    - angular_jitter: Gaussian jitter on position / Bragg angles
+    - crosstalk: soft leakage between neighbouring angular channels
+    - noise: NoiseConfig that overrides the individual knobs
+
     Query and key positions must differ for the effect to show up:
     identical positions on both sides cancel in
     `Re(q_wave * conj(k_wave))` and silently fall back to the binary
     case (see `encode_angular_phase`).
     """
+    if noise is not None:
+        phase_bits = noise.phase_bits if noise.phase_bits is not None else phase_bits
+        phase_sigma = noise.phase_sigma
+        angular_jitter = noise.angular_jitter
+        crosstalk = noise.crosstalk
+        crosstalk_kernel = noise.crosstalk_kernel
+
     if normalize:
         query = F.normalize(query, p=2, dim=-1)
         key = F.normalize(key, p=2, dim=-1)
@@ -157,11 +187,25 @@ def optical_scores_general(
             query_positions = torch.zeros(query.shape[:-1], device=query.device, dtype=query.dtype)
         if key_positions is None:
             key_positions = torch.zeros(key.shape[:-1], device=key.device, dtype=key.dtype)
-        q_wave = encode_angular_phase(query, query_positions, phase_bits=phase_bits)
-        k_wave = encode_angular_phase(key, key_positions, phase_bits=phase_bits)
+
+        if angular_jitter > 0:
+            query_positions = add_angular_jitter(query_positions, angular_jitter)
+            key_positions = add_angular_jitter(key_positions, angular_jitter)
+
+        q_wave = encode_angular_phase(
+            query, query_positions, phase_bits=phase_bits, phase_sigma=phase_sigma
+        )
+        k_wave = encode_angular_phase(
+            key, key_positions, phase_bits=phase_bits, phase_sigma=phase_sigma
+        )
 
     scores = torch.einsum("...qd,...kd->...qk", q_wave, torch.conj(k_wave)).real
-    return scores / scale
+    scores = scores / scale
+
+    if crosstalk > 0:
+        scores = apply_crosstalk(scores, strength=crosstalk, kernel_size=crosstalk_kernel)
+
+    return scores
 
 
 class OpticalSelfAttention(nn.Module):

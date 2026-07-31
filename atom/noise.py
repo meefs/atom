@@ -6,11 +6,15 @@ the continuous-phase math works in the ideal case (see attention.py):
 a real crystal can't write an infinite-precision phase angle. It writes
 theta to some finite number of bits. This module answers "how many bits
 before that actually matters."
+
+Also covers Gaussian phase noise, angular (Bragg) position jitter, and
+soft inter-channel crosstalk on attention scores.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -35,3 +39,74 @@ def quantize_phase(phase: torch.Tensor, bits: int) -> torch.Tensor:
     # is the same physical angle as 0 but a distinct float value -- wrap
     # again so that boundary collapses to the single level it actually is.
     return torch.remainder(quantized, 2 * math.pi)
+
+
+def add_phase_noise(phase: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Add independent Gaussian phase jitter in radians.
+
+    Covers write noise, residual SLM error, or uncorrected phase drift.
+    sigma is the standard deviation. sigma=0 is a no-op.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if sigma == 0:
+        return phase
+    return phase + torch.randn_like(phase) * sigma
+
+
+def add_angular_jitter(positions: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Add Gaussian jitter to angular / Bragg positions.
+
+    Models thermal or mechanical drift of the incidence angle.
+    sigma uses the same units as `positions`. sigma=0 is a no-op.
+    """
+    if sigma < 0:
+        raise ValueError("sigma must be non-negative")
+    if sigma == 0:
+        return positions
+    return positions + torch.randn_like(positions) * sigma
+
+
+def apply_crosstalk(
+    scores: torch.Tensor,
+    strength: float,
+    kernel_size: int = 3,
+) -> torch.Tensor:
+    """Soft leakage between neighbouring angular channels.
+
+    `scores` shape is (..., query_seq, key_seq). Mixing happens along the
+    key (angular) axis. `strength` in [0, 1] sets how much of the local
+    neighbourhood is blended in (0 = none, 1 = full average over the kernel).
+
+    Uses a uniform box kernel for now. A measured Bragg selectivity curve
+    can replace it later without changing the call signature.
+    """
+    if strength < 0 or strength > 1:
+        raise ValueError("strength must be in [0, 1]")
+    if strength == 0 or kernel_size <= 1:
+        return scores
+    if kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be odd")
+
+    pad = kernel_size // 2
+    padded = torch.nn.functional.pad(scores, (pad, pad), mode="replicate")
+    mixed = torch.zeros_like(scores)
+    for i in range(kernel_size):
+        mixed = mixed + padded[..., i : i + scores.shape[-1]]
+    mixed = mixed / kernel_size
+
+    return (1.0 - strength) * scores + strength * mixed
+
+
+@dataclass
+class NoiseConfig:
+    """Optional noise parameters, all defaulting to ideal / off.
+
+    Pass this (or the individual kwargs) into the optical score functions.
+    """
+
+    phase_bits: int | None = None
+    phase_sigma: float = 0.0
+    angular_jitter: float = 0.0
+    crosstalk: float = 0.0
+    crosstalk_kernel: int = 3
