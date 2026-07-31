@@ -35,7 +35,9 @@ where `d_grating` is the grating spacing, `θ` is the Bragg angle, `m` is the di
 
 ## Parameter capacity
 
-The 90T figure is a geometric capacity argument. It is the maximum number of independent weight values the physical medium can store and address, under the stated simulation parameters.
+### Geometric ceiling
+
+The 90T figure is a pure geometric argument. It is the maximum number of independent weight values the physical medium could store and address if dynamic range were infinite, under the stated simulation parameters.
 
 ```
 Z-layers       = 1 cm / 10 µm             = 1,000    (depth resolution)
@@ -46,21 +48,31 @@ Raw capacity   = 1,000 × 900 × 10⁸        = 9 × 10¹³ (90T)
 
 This is not a trained model size. It is the storage capacity of the volume analogous to saying a hard drive holds 2 TB, before any data is written to it.
 
-Conservative estimates:
+### Dynamic-range limit (M#)
 
-| Scenario | Capacity |
-|----------|----------|
-| Raw geometric maximum | 90T |
-| 50% reserved for error correction and redundancy | 45T |
-| Practical (accounting for multiplexing crosstalk) | 4.5T- 9T |
-
-For comparison, the NVIDIA H100 SXM stores 20–35B parameters in FP16 across 80–141 GB of HBM. The projected density advantage at the reference configuration is:
+Real photorefractive media have finite dynamic range, measured by the M-number (M#). For equal-efficiency recording of M holograms the diffraction efficiency of each scales as
 
 ```
-45T usable / 35B H100 ≈ 1,285× per cm³ of active storage volume
+eta ≈ (M# / M)**2
 ```
 
-The H100 package including HBM spans hundreds of cubic centimetres. A full volume-normalized comparison narrows this gap considerably — see Figure 2 in `figures/fig2_parameter_density.png` for the full scaling surface across crystal sizes and angular resolutions.
+so the usable channel count is limited by the lowest eta still readable at acceptable SNR:
+
+```
+M_usable ≈ M# / sqrt(eta_min)
+```
+
+For iron-doped lithium niobate (Fe:LiNbO₃) in the 90-degree geometry, conservative literature values are M# ≈ 2 and eta_min ≈ 10⁻⁴. Under those assumptions the angular channel count drops from the geometric 900 to ~200, and usable capacity becomes:
+
+```
+1,000 layers × 200 channels × 10⁸ pixels ≈ 2 × 10¹³  (20T)
+```
+
+That is still a geometric-style upper bound under the equal-efficiency model; experimental net densities reported for Fe:LiNbO₃ systems are lower once scatter, coding overhead, and readout constraints are included. The `atom.capacity` module exposes the parameters so the estimate can be updated with better measured M# or eta_min values.
+
+See `examples/06_capacity_fe_linbo3.py` for a short sensitivity sweep.
+
+For comparison, the NVIDIA H100 SXM stores 20–35B parameters in FP16 across 80–141 GB of HBM. Even under the M#-limited figure the volumetric density remains higher than a single HBM stack; a full system comparison must also account for the optical and electronic periphery.
 
 ---
 
@@ -126,10 +138,8 @@ No energy measurement has been performed. These are architecture-level projectio
 | Forward/backward propagation is reversible | ✓ Numerically verified |
 | Optical scores identical to scaled dot-product attention | ✓ Exact to float precision |
 | Gradients finite through full optical path | ✓ Verified |
-| 90T parameter capacity per cm³ | Geometric derivation not experimentally validated |
+| 90T geometric capacity per cm³ | Geometric derivation; dynamic-range limited estimate is lower (see M# section) |
 | ~50–200 ps latency for 1–4 cm device | Physics derivation (τ = Ln/c) not measured |
 | ~99% energy reduction | Architecture projection not measured |
 | Bragg angle selectivity enables independent multiplexing | Established physics not validated in this device |
-| >99% inference accuracy | **Not claimed. No noise model in this codebase.** |
-
-The last row is a deliberate omission. Accuracy on a real task requires a noise model, a task benchmark, and hardware. A simulation running in a noiseless mathematical environment cannot make that claim honestly.
+| Inference accuracy on real tasks | Requires noise model + task benchmark; noise model now present, task numbers still open |

@@ -16,7 +16,7 @@ This document breaks down exactly what needs to happen next, by domain. Find you
 - Characterizing M# (dynamic range figure of merit) for candidate materials under dense angular multiplexing
 - Modelling SNR degradation as a function of hologram count for lithium niobate and barium titanate
 
-**How to contribute:** Add a `materials/` module with noise and SNR models. Even a calibrated estimate of M# degradation under M=900 multiplexed holograms would close the biggest gap between the geometric capacity ceiling and the realistic usable number.
+**How to contribute:** The `atom.capacity` module already exposes M# and eta_min as parameters with Fe:LiNbO₃ defaults. Better measured values, or a calibrated SNR-vs-M curve, can be dropped in directly. A full materials noise model (erasure dynamics, scatter) is still open.
 
 ---
 
@@ -36,15 +36,15 @@ This document breaks down exactly what needs to happen next, by domain. Find you
 
 ## Noise Modelling
 
-**The core problem:** The simulator runs in a noiseless mathematical environment. A real device has phase noise, thermal drift, inter-hologram crosstalk, detector shot noise, and write precision limits. None of these are modelled. Until they are, inference accuracy is completely unknown.
+**The core problem:** The simulator originally ran in a noiseless mathematical environment. Phase quantisation, Gaussian phase noise, angular jitter, and a simple crosstalk kernel are now present. Detector shot noise, a measured Bragg selectivity curve, and full thermal-drift models are still open.
 
 **Open problems:**
-- Phase quantisation: what happens to attention scores when `theta` is quantised to N bits?
-- Crosstalk model: simulate SNR degradation as angular channel count increases from M=1 to M=900
+- Replace the uniform crosstalk kernel with a measured angular selectivity profile
 - Thermal drift: model Bragg angle shift as a function of temperature and crystal coefficient of thermal expansion
-- End-to-end noisy inference: run a real task benchmark with a calibrated noise model and report top-1 accuracy
+- Detector / readout noise on the intensity path
+- End-to-end noisy inference on a real task with calibrated noise and reported accuracy
 
-**How to contribute:** Add a `noise/` module. Start with phase quantisation — it's the most tractable and gives immediate signal on how sensitive the attention computation is to imperfect weight encoding. Add tests under `tests/` and document assumptions in `docs/`.
+**How to contribute:** Extend `atom/noise.py` and the corresponding tests. The existing `NoiseConfig` is the intended place to hang new knobs.
 
 ---
 
@@ -57,8 +57,9 @@ This document breaks down exactly what needs to happen next, by domain. Find you
 - Hybrid inference stack: optical QK scores + digital softmax/V aggregation — profile latency and energy for a real model
 - Quantisation-aware weight encoding: what's the minimum phase precision needed to maintain attention accuracy within 1% of digital?
 - Forward-pass-only training: can the optical path be trained without backpropagation? (See gradient estimation literature)
+- Multi-crystal / rack-scale composition: treat each crystal (or crystal module) as an optical attention accelerator and partition a large model across many of them, the same way multi-GPU systems partition today. Interconnect, activation movement, and scheduling are open systems-engineering problems.
 
-**How to contribute:** The weight conversion stub lives in `atom/attention.py`. A full pipeline that takes a `.safetensors` or `.gguf` checkpoint and outputs phase mask values would be the highest-leverage ML contribution possible right now.
+**How to contribute:** The weight conversion stub lives in `atom/attention.py`. A full pipeline that takes a `.safetensors` or `.gguf` checkpoint and outputs phase mask values would be the highest-leverage ML contribution possible right now. System-level multi-module design belongs here as well.
 
 ---
 

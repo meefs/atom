@@ -16,6 +16,13 @@ from .attention import (
     encode_angular_phase,
     OpticalSelfAttention,
 )
+from .capacity import (
+    CapacityParams,
+    max_usable_channels,
+    geometric_capacity,
+    usable_capacity,
+    capacity_summary,
+)
 
 __all__ = [
     "WavePropagator",
@@ -33,4 +40,9 @@ __all__ = [
     "encode_signed_values",
     "encode_angular_phase",
     "OpticalSelfAttention",
+    "CapacityParams",
+    "max_usable_channels",
+    "geometric_capacity",
+    "usable_capacity",
+    "capacity_summary",
 ]
