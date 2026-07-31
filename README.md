@@ -2,67 +2,53 @@
 # ATOM
 **Angular-Multiplexed Transformer Optical Model**
 
-What if a neural network's weights didn't exist as floating points in memory but in holograms?
+What if a neural network's weights didn't exist as floating points in memory but as phase structure in a holographic crystal?
 
-This repo is a numerically verified simulation showing that AI weights, encoded as phase structure inside a holographic crystal, can perform transformer attention exactly through wave interference. Not approximately. Algebraically identical to. Verified in code you can run in one command.
+This repo is a numerically verified simulation of that idea. The core result: when query and key vectors are encoded as optical waves with binary phase (0 or π), their interference scores are **algebraically identical** to scaled dot-product attention — term for term, verified to float precision on arbitrary tensors. A continuous-phase generalization (angular multiplexing) is also implemented and reduces to that exact case when relative positions are zero.
 
-The base proof uses a binary phase encoding (0 or π) — that's the exact phase choice needed for the equivalence to hold term-for-term, not an incidental simplification. A genuine continuous-phase generalization, which reduces to this exact result as a special case, is also implemented and tested. See [`docs/model.md`](docs/model.md) for both.
+What is optical is the **score matrix**. Softmax, value aggregation, residuals, and norms stay digital. The practical block is hybrid: optical scores + digital remainder. See [`atom/hybrid.py`](atom/hybrid.py).
 
-The math is proved. The hardware doesn't exist yet. That's the point of open sourcing this.
-
----
-
-## What this actually is
-
-A standard transformer spends most of its energy moving weights from memory to compute and back. Every forward pass, every token, billions of numbers shuffling across a bus.
-
-This project asks: what if the weights *were* the computer?
-
-A photorefractive crystal stores holograms through its entire volume using Bragg angle selectivity — write a pattern at a specific angle, and only light arriving at that exact angle reads it back. Change the angle by a fraction of a degree and you're reading a completely different stored pattern. This is angular multiplexing: hundreds of independent weight matrices living in the same cubic centimetre of crystal, each addressed by angle.
-
-The ATOM simulator models this in PyTorch. It proves that when query and key vectors are encoded as optical wave amplitudes and interfere inside such a crystal, the output is algebraically identical to scaled dot-product attention. The computation happens through physics — diffraction and interference — not digital arithmetic. The base proof deliberately uses the simplest possible phase encoding (sign as 0/π) to make this equivalence exact rather than approximate; `atom/attention.py` also includes a continuous-phase version (`optical_scores_general`) for cases where richer interference behavior — not just exact recovery — is what matters.
-
-For the full mathematical derivation of how the proof works, see [`docs/model.md`](docs/model.md).
+The math for the scores is proved. The hardware does not exist yet. That is the point of open sourcing this.
 
 ---
 
-## The capacity numbers (and what they actually mean)
-
-A 1 cm³ crystal at reference parameters holds:
-
-```
-1,000 depth layers × 900 angular channels × 100M pixels/layer = 90 trillion addressable weight values
-```
-
-This is a geometric ceiling — the storage capacity of the medium before any data is written, like saying a hard drive holds 2 TB before formatting. Here's the honest range of what's usable:
-
-| Scenario | Capacity | Notes |
-|----------|----------|-------|
-| Geometric ceiling | 90T | Pure math, no physical losses |
-| 50% error correction allocation | 45T | Half reserved for redundancy |
-| Realistic (SNR + crosstalk degradation) | 4.5T – 9T (for reference, GPT 4 is 1.8T params| 5–10% of ceiling under real multiplexing conditions |
-| NVIDIA H100 (for reference) | 20–35B | Measured hardware |
-
-The 5–10% realistic figure is where the engineering gets hard. It's also where most of the interesting open problems live. For the full derivation of every number in this table — assumptions, sources, and what's measured vs projected — see [`docs/benchmarks.md`](docs/benchmarks.md).
-
----
-
-## What's proved vs what's projected
+## What is proved vs what is projected
 
 | Claim | Status |
 |-------|--------|
-| Optical interference = scaled dot-product attention (binary phase, exact) | ✓ Proved and verified to float precision |
-| Continuous-phase interference reduces to the above as a special case | ✓ Verified — see `optical_scores_general` |
-| Angular Spectrum Method conserves energy | ✓ < 2.3×10⁻⁷ relative error |
-| Phase masks preserve intensity | ✓ Verified |
-| Field propagation is reversible | ✓ Verified |
-| Gradients flow through the full optical path | ✓ Verified |
-| 90T geometric capacity per cm³ | Geometric derivation — not experimentally validated |
-| 50–200 ps latency | Physics derivation — not measured |
-| ~99% energy reduction | Architecture projection — not measured |
-| Inference accuracy on real tasks | **Not claimed. There is no noise model.** |
+| Optical interference = scaled dot-product **scores** (binary phase, exact) | Proved and verified to float precision |
+| Continuous-phase path reduces to the above when positions match | Verified |
+| ASM energy conservation, phase-mask intensity, reversible propagation | Verified |
+| Gradients flow through the optical score path | Verified |
+| Phase quantisation, phase noise, angular jitter, crosstalk models | Implemented (`atom/noise.py`) |
+| M#-limited capacity for Fe:LiNbO₃ | Implemented (`atom/capacity.py`); geometric 90T is an upper bound only |
+| Hybrid optical-QK + digital remainder module | Implemented (`atom/hybrid.py`) |
+| Weight conversion from a local checkpoint | Implemented (`atom/convert.py`); you supply the model on disk |
+| Full-model optical inference (everything optical) | **Not claimed** |
+| Task accuracy on a real benchmark under noise | **Not claimed yet** — needs a real checkpoint + eval run |
+| Measured hardware latency / energy | **Not claimed** |
 
-The last row is intentional. Accuracy claims require a noise model, a task benchmark, and hardware. None of those exist here yet.
+The score equivalence does **not** require a trained model. It holds for any Q and K tensors. Task-level numbers require loading real weights and running the hybrid path under noise.
+
+---
+
+## Capacity (honest version)
+
+Geometric ceiling under the simulation grid (1 cm³):
+
+```
+1,000 layers × 900 angular channels × 10⁸ pixels/layer = 9×10¹³  (90T)
+```
+
+That ignores dynamic range. Photorefractive media are limited by M#. For conservative Fe:LiNbO₃ parameters (M# ≈ 2, η_min ≈ 10⁻⁴) usable angular channels drop and the M#-aware estimate is lower (see `atom/capacity.py` and `docs/benchmarks.md`). Experimental net densities in the literature are lower still once scatter, coding, and readout are included.
+
+Multi-crystal / rack-scale composition (many modules, each holding part of a large model) is an open systems-engineering problem, not a materials claim. See CONTRIBUTING.md.
+
+---
+
+## Phase precision
+
+A sweep over phase bit-width (`examples/05_phase_quantization_sweep.py`) shows that around **8 bits** attention KL vs continuous phase is already ~1e-5 and top-1 agreement is ~99.5% on synthetic Q/K. That is the default write precision used by the weight converter unless you override it.
 
 ---
 
@@ -74,29 +60,19 @@ cd atom
 pip install -e .
 ```
 
-If you don't have PyTorch yet:
-```bash
-pip install "atom-optic[torch]"
-```
-
-If you want everything in one shot:
-```bash
-pip install "atom-optic[full]"
-```
-
-Run everything and see all validation results:
-
 ```bash
 python scripts/run_all.py
 ```
 
-Or step through the concepts in order:
-
 ```bash
-python examples/01_propagate_beam.py      # Gaussian beam through free space
-python examples/02_train_phase_mask.py    # train a phase mask to focus light
-python examples/03_optical_attention.py   # optical vs digital attention — exact match
-python examples/04_validate_model.py      # all numerical checks with tolerances
+python examples/01_propagate_beam.py
+python examples/02_train_phase_mask.py
+python examples/03_optical_attention.py
+python examples/04_validate_model.py
+python examples/05_phase_quantization_sweep.py
+python examples/06_capacity_fe_linbo3.py
+python examples/07_hybrid_attention.py
+python examples/08_convert_weights.py   # synthetic demo; point at your local model for real weights
 ```
 
 ---
@@ -104,29 +80,38 @@ python examples/04_validate_model.py      # all numerical checks with tolerances
 ## Project layout
 
 ```
-atom/                        ← core library
-├── propagation.py           ← Angular Spectrum Method, field helpers
-├── diffractive.py           ← trainable phase masks, diffractive network
-└── attention.py             ← interference-based attention scores
+atom/
+├── propagation.py    Angular Spectrum Method
+├── diffractive.py    Phase masks
+├── attention.py      Optical scores (binary + continuous phase)
+├── noise.py          Phase quant, phase noise, jitter, crosstalk
+├── capacity.py       M#-aware capacity (Fe:LiNbO₃ defaults)
+├── hybrid.py         Optical scores + digital remainder
+└── convert.py        Local checkpoint → optical weight tensors
 
-examples/                    ← one concept per script, run in order
-scripts/run_all.py           ← runs everything, writes results/
-tests/                       ← unit tests
-results/                     ← validation output (generated at runtime)
-figures/                     ← plots from simulation
-
-docs/
-├── model.md                 ← full mathematical derivation of the proof
-└── benchmarks.md            ← every projection with full assumptions and sources
+examples/             One concept per script
+tests/
+docs/model.md         Math derivation of the score proof
+docs/benchmarks.md    Capacity, latency, energy assumptions
 ```
+
+---
+
+## Loading your own model
+
+Do not commit multi-GB weights into this repo. Download a model on your machine (e.g. Midnight Bundle or any HF/safetensors folder), then:
+
+```bash
+python examples/08_convert_weights.py --model /path/to/model --out ./optical_weights
+```
+
+The converter maps attention projections into phase-encoded tensors (default 8-bit phase). You can then run them through `HybridOpticalAttention` under `NoiseConfig`.
 
 ---
 
 ## Where this needs to go next
 
-The math is done. The simulator works. What doesn't exist yet is everything physical — and that's what this repo is for. See [CONTRIBUTING.md](CONTRIBUTING.md) for specific open problems by domain.
-
-Building a real device requires solving noise, materials, readout, and system integration problems that this codebase deliberately does not claim to have solved. If you work in any of those areas, there is a concrete problem in CONTRIBUTING.md with your name on it.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Highest-leverage remaining work: end-to-end noisy eval on a real task with converted weights, richer noise (detector, measured Bragg curve), and multi-module system design.
 
 ---
 

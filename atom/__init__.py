@@ -29,6 +29,14 @@ from .hybrid import (
     optical_time_of_flight,
     estimate_digital_flops,
 )
+from .convert import (
+    encode_weight_matrix,
+    convert_state_dict,
+    convert_checkpoint,
+    save_conversion,
+    OpticalWeightTensor,
+    ConversionResult,
+)
 
 __all__ = [
     "WavePropagator",
@@ -55,4 +63,10 @@ __all__ = [
     "AccountingReport",
     "optical_time_of_flight",
     "estimate_digital_flops",
+    "encode_weight_matrix",
+    "convert_state_dict",
+    "convert_checkpoint",
+    "save_conversion",
+    "OpticalWeightTensor",
+    "ConversionResult",
 ]
