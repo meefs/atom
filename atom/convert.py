@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,17 +22,18 @@ import torch
 from .noise import quantize_phase
 
 # Common attention projection name patterns (HF / GPT-2 / Llama-style)
+# Note: fused GPT-2 c_attn is handled separately and must not match q_proj.
 _Q_PATTERNS = re.compile(
-    r"(.*?)(?:q_proj|query|q_lin|to_q|c_attn)$", re.IGNORECASE
+    r"(?:^|[.])(?:q_proj|query|q_lin|to_q)$", re.IGNORECASE
 )
 _K_PATTERNS = re.compile(
-    r"(.*?)(?:k_proj|key|k_lin|to_k)$", re.IGNORECASE
+    r"(?:^|[.])(?:k_proj|key|k_lin|to_k)$", re.IGNORECASE
 )
 _V_PATTERNS = re.compile(
-    r"(.*?)(?:v_proj|value|v_lin|to_v)$", re.IGNORECASE
+    r"(?:^|[.])(?:v_proj|value|v_lin|to_v)$", re.IGNORECASE
 )
 _O_PATTERNS = re.compile(
-    r"(.*?)(?:o_proj|out_proj|c_proj|to_out\.0)$", re.IGNORECASE
+    r"(?:^|[.])(?:o_proj|out_proj|c_proj|to_out\.0)$", re.IGNORECASE
 )
 
 
@@ -41,9 +42,9 @@ class OpticalWeightTensor:
     """One weight matrix encoded for the optical path."""
 
     name: str
-    amplitude: torch.Tensor  # abs(weight)
-    phase: torch.Tensor      # 0 or pi for sign; optionally quantised continuous
-    shape: tuple[int, ...]
+    amplitude: torch.Tensor
+    phase: torch.Tensor
+    shape: tuple
     phase_bits: int | None
 
     def to_complex(self) -> torch.Tensor:
@@ -52,14 +53,14 @@ class OpticalWeightTensor:
 
 @dataclass
 class ConversionResult:
-    weights: dict[str, OpticalWeightTensor]
-    meta: dict[str, Any]
+    weights: dict
+    meta: dict
 
 
 def encode_weight_matrix(
     weight: torch.Tensor,
     phase_bits: int | None = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple:
     """Map a real weight matrix to amplitude + phase.
 
     Sign is stored as binary phase (0 / pi). If phase_bits is set, phase is
@@ -73,7 +74,15 @@ def encode_weight_matrix(
     return amplitude, phase
 
 
-def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
+def _torch_load(path: str):
+    """Load a pickle checkpoint; weights_only when supported."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_state_dict(path: Path) -> dict:
     path = Path(path)
     if path.is_file():
         if path.suffix == ".safetensors":
@@ -84,15 +93,13 @@ def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
                     "safetensors is required to load .safetensors files"
                 ) from e
             return load_file(str(path))
-        obj = torch.load(str(path), map_location="cpu", weights_only=True)
+        obj = _torch_load(str(path))
         if isinstance(obj, dict) and "state_dict" in obj:
             return obj["state_dict"]
         if isinstance(obj, dict):
-            # HF-style or raw state dict
             return {k: v for k, v in obj.items() if torch.is_tensor(v)}
         raise ValueError(f"Unsupported checkpoint format: {path}")
 
-    # Directory: prefer safetensors shards, else bin
     st = list(path.glob("*.safetensors"))
     if st:
         try:
@@ -101,7 +108,7 @@ def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
             raise ImportError(
                 "safetensors is required to load .safetensors files"
             ) from e
-        out: dict[str, torch.Tensor] = {}
+        out = {}
         for f in st:
             out.update(load_file(str(f)))
         return out
@@ -110,7 +117,7 @@ def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
     if bins:
         out = {}
         for f in bins:
-            part = torch.load(str(f), map_location="cpu", weights_only=True)
+            part = _torch_load(str(f))
             if isinstance(part, dict):
                 out.update({k: v for k, v in part.items() if torch.is_tensor(v)})
         return out
@@ -119,10 +126,12 @@ def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
 
 
 def _classify_key(key: str) -> str | None:
-    # Strip common suffixes
     k = key
     if k.endswith(".weight"):
         k = k[: -len(".weight")]
+    # Fused GPT-2 style must be checked before generic q/k/v patterns
+    if k.endswith("c_attn") or k.endswith(".attn.c_attn"):
+        return "c_attn"
     if _O_PATTERNS.search(k):
         return "o"
     if _Q_PATTERNS.search(k):
@@ -131,19 +140,16 @@ def _classify_key(key: str) -> str | None:
         return "k"
     if _V_PATTERNS.search(k):
         return "v"
-    # GPT-2 fused c_attn: handled separately
-    if k.endswith("c_attn") or k.endswith("attn.c_attn"):
-        return "c_attn"
     return None
 
 
 def convert_state_dict(
-    state: dict[str, torch.Tensor],
+    state: dict,
     phase_bits: int | None = 8,
     include_output_proj: bool = True,
 ) -> ConversionResult:
     """Convert attention-related tensors in a state dict to optical form."""
-    optical: dict[str, OpticalWeightTensor] = {}
+    optical = {}
     skipped = []
 
     for key, tensor in state.items():
@@ -158,11 +164,13 @@ def convert_state_dict(
             continue
 
         if kind == "c_attn":
-            # GPT-2: [q | k | v] fused on dim 0
             if tensor.ndim != 2:
                 skipped.append(key)
                 continue
             d = tensor.shape[0] // 3
+            if d * 3 != tensor.shape[0]:
+                skipped.append(key)
+                continue
             for name, chunk in zip(
                 ("q", "k", "v"),
                 (tensor[:d], tensor[d : 2 * d], tensor[2 * d :]),
@@ -197,7 +205,7 @@ def convert_state_dict(
 
 
 def convert_checkpoint(
-    path: str | Path,
+    path,
     phase_bits: int | None = 8,
     include_output_proj: bool = True,
 ) -> ConversionResult:
@@ -208,7 +216,7 @@ def convert_checkpoint(
     )
 
 
-def save_conversion(result: ConversionResult, out_dir: str | Path) -> None:
+def save_conversion(result: ConversionResult, out_dir) -> None:
     """Write amplitude/phase tensors and metadata to a directory."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
