@@ -1,15 +1,6 @@
 """Unified hybrid optical-score model: GGUF or Hugging Face safetensors.
 
-Same internal weight layout and forward path for both sources. Plug in a
-GGUF file today; later point at a safetensors folder without changing the
-inference API.
-
-Attention scores use the optical path. Embed, norms, MLP, RoPE, V, out,
-lm_head stay digital on checkpoint weights.
-
-Layer streaming (stream_layers=True) keeps only one transformer layer in
-memory at a time so a full 32-layer 7B run is more likely to fit on a
-machine that OOMs when all layers are resident.
+Same internal weight layout and forward path for both sources.
 """
 
 from __future__ import annotations
@@ -25,7 +16,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .attention import optical_scores, optical_scores_general
+from .attention import optical_scores, optical_scores_general, optical_scores_multihead
 from .noise import NoiseConfig
 
 
@@ -85,8 +76,6 @@ def _to_f16(t: torch.Tensor) -> torch.Tensor:
     return t.detach().to(torch.float16).contiguous()
 
 
-# ---- GGUF ----
-
 def _gguf_dequant(tensor) -> torch.Tensor:
     import gguf
     from gguf import GGMLQuantizationType
@@ -120,11 +109,7 @@ def _gguf_layer_keys(i: int) -> list[str]:
     ]
 
 
-def _load_gguf_bundle(
-    path: Path,
-    max_layers: int | None,
-    stream_layers: bool,
-) -> tuple[dict, ModelConfig, Any]:
+def _load_gguf_bundle(path: Path, max_layers: int | None, stream_layers: bool):
     import gguf
 
     reader = gguf.GGUFReader(str(path))
@@ -133,17 +118,14 @@ def _load_gguf_bundle(
     while f"blk.{n_total}.attn_q.weight" in name_to_tensor:
         n_total += 1
     n_layers = n_total if max_layers is None else min(n_total, max_layers)
-
     shared_names = ["token_embd.weight", "output_norm.weight", "output.weight"]
     weights: dict = {}
     for name in shared_names:
         weights[name] = _gguf_dequant(name_to_tensor[name])
-
     if not stream_layers:
         for i in range(n_layers):
             for name in _gguf_layer_keys(i):
                 weights[name] = _gguf_dequant(name_to_tensor[name])
-
     if f"blk.0.attn_q.weight" in weights:
         q0 = weights["blk.0.attn_q.weight"]
         k0 = weights["blk.0.attn_k.weight"]
@@ -152,7 +134,6 @@ def _load_gguf_bundle(
         q0 = _gguf_dequant(name_to_tensor["blk.0.attn_q.weight"])
         k0 = _gguf_dequant(name_to_tensor["blk.0.attn_k.weight"])
         g0 = _gguf_dequant(name_to_tensor["blk.0.ffn_gate.weight"])
-
     emb = weights["token_embd.weight"]
     head_dim = 128
     cfg = ModelConfig(
@@ -190,11 +171,7 @@ def _hf_layer_map(i: int) -> dict[str, str]:
     }
 
 
-def _load_hf_bundle(
-    path: Path,
-    max_layers: int | None,
-    stream_layers: bool,
-) -> tuple[dict, ModelConfig, Any]:
+def _load_hf_bundle(path: Path, max_layers: int | None, stream_layers: bool):
     path = Path(path)
     if path.is_file() and path.suffix == ".safetensors":
         files = [path]
@@ -204,29 +181,22 @@ def _load_hf_bundle(
         files = sorted(path.glob("*.safetensors"))
         if not files:
             raise FileNotFoundError(f"No .safetensors under {path}")
-
     all_keys: dict[str, Path] = {}
     for f in files:
-        try:
-            from safetensors import safe_open
-        except ImportError as e:
-            raise ImportError("pip install safetensors") from e
+        from safetensors import safe_open
         with safe_open(str(f), framework="pt", device="cpu") as sf:
             for k in sf.keys():
                 all_keys[k] = f
 
     def get_tensor(key: str) -> torch.Tensor:
-        f = all_keys[key]
         from safetensors import safe_open
-
-        with safe_open(str(f), framework="pt", device="cpu") as sf:
+        with safe_open(str(all_keys[key]), framework="pt", device="cpu") as sf:
             return _to_f16(sf.get_tensor(key))
 
     n_total = 0
     while f"model.layers.{n_total}.self_attn.q_proj.weight" in all_keys:
         n_total += 1
     n_layers = n_total if max_layers is None else min(n_total, max_layers)
-
     weights: dict = {}
     for hf, internal in _HF_TO_INTERNAL.items():
         if hf not in all_keys:
@@ -235,44 +205,24 @@ def _load_hf_bundle(
                 continue
             raise KeyError(f"Missing {hf} in {path}")
         weights[internal] = get_tensor(hf)
-
     if not stream_layers:
         for i in range(n_layers):
             for hf, internal in _hf_layer_map(i).items():
                 weights[internal] = get_tensor(hf)
-
-    q0 = (
-        weights["blk.0.attn_q.weight"]
-        if "blk.0.attn_q.weight" in weights
-        else get_tensor("model.layers.0.self_attn.q_proj.weight")
-    )
-    k0 = (
-        weights["blk.0.attn_k.weight"]
-        if "blk.0.attn_k.weight" in weights
-        else get_tensor("model.layers.0.self_attn.k_proj.weight")
-    )
-    g0 = (
-        weights["blk.0.ffn_gate.weight"]
-        if "blk.0.ffn_gate.weight" in weights
-        else get_tensor("model.layers.0.mlp.gate_proj.weight")
-    )
+    q0 = weights.get("blk.0.attn_q.weight") or get_tensor("model.layers.0.self_attn.q_proj.weight")
+    k0 = weights.get("blk.0.attn_k.weight") or get_tensor("model.layers.0.self_attn.k_proj.weight")
+    g0 = weights.get("blk.0.ffn_gate.weight") or get_tensor("model.layers.0.mlp.gate_proj.weight")
     emb = weights["token_embd.weight"]
     cfg_path = root / "config.json"
-    meta = {}
-    if cfg_path.exists():
-        meta = json.loads(cfg_path.read_text())
-
+    meta = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
     if meta.get("num_attention_heads") and meta.get("hidden_size"):
         n_heads = int(meta["num_attention_heads"])
         n_kv_heads = int(meta.get("num_key_value_heads", n_heads))
         head_dim = int(meta["hidden_size"]) // n_heads
     else:
-        head_dim = 64 if q0.shape[0] % 64 == 0 and (q0.shape[0] // 64) <= 32 else 128
-        while head_dim > 8 and (q0.shape[0] % head_dim != 0 or k0.shape[0] % head_dim != 0):
-            head_dim //= 2
+        head_dim = 64 if q0.shape[0] % 64 == 0 else 128
         n_heads = q0.shape[0] // head_dim
         n_kv_heads = k0.shape[0] // head_dim
-
     cfg = ModelConfig(
         n_layers=n_layers,
         n_heads=n_heads,
@@ -286,7 +236,6 @@ def _load_hf_bundle(
     if meta:
         cfg.rms_eps = float(meta.get("rms_norm_eps", cfg.rms_eps))
         cfg.rope_theta = float(meta.get("rope_theta", cfg.rope_theta))
-
     backend = {
         "kind": "safetensors",
         "get_tensor": get_tensor if stream_layers else None,
@@ -296,16 +245,7 @@ def _load_hf_bundle(
 
 
 class HybridTransformer(torch.nn.Module):
-    """Hybrid optical-score transformer from GGUF or safetensors."""
-
-    def __init__(
-        self,
-        weights: dict,
-        cfg: ModelConfig,
-        backend: dict | None = None,
-        noise: NoiseConfig | None = None,
-        stream_layers: bool = False,
-    ):
+    def __init__(self, weights, cfg, backend=None, noise=None, stream_layers=False):
         super().__init__()
         self.weights = weights
         self.cfg = cfg
@@ -314,22 +254,14 @@ class HybridTransformer(torch.nn.Module):
         self.stream_layers = stream_layers
 
     @classmethod
-    def from_checkpoint(
-        cls,
-        path: str | Path,
-        max_layers: int | None = None,
-        stream_layers: bool = False,
-        noise: NoiseConfig | None = None,
-    ) -> "HybridTransformer":
+    def from_checkpoint(cls, path, max_layers=None, stream_layers=False, noise=None):
         path = Path(path)
         if path.is_file() and path.suffix.lower() == ".gguf":
             weights, cfg, backend = _load_gguf_bundle(path, max_layers, stream_layers)
         elif path.is_dir() or (path.is_file() and path.suffix == ".safetensors"):
             weights, cfg, backend = _load_hf_bundle(path, max_layers, stream_layers)
         else:
-            raise ValueError(
-                f"Unsupported checkpoint {path}. Use a .gguf file or a HF safetensors directory."
-            )
+            raise ValueError(f"Unsupported checkpoint {path}")
         return cls(weights, cfg, backend=backend, noise=noise, stream_layers=stream_layers)
 
     def _ensure_layer(self, layer: int) -> None:
@@ -338,15 +270,13 @@ class HybridTransformer(torch.nn.Module):
             return
         kind = self.backend.get("kind")
         if kind == "gguf":
-            name_to_tensor = self.backend["name_to_tensor"]
             for name in _gguf_layer_keys(layer):
-                self.weights[name] = _gguf_dequant(name_to_tensor[name])
+                self.weights[name] = _gguf_dequant(self.backend["name_to_tensor"][name])
         elif kind == "safetensors":
-            get_tensor = self.backend["get_tensor"]
             for hf, internal in self.backend["hf_layer_map"](layer).items():
-                self.weights[internal] = get_tensor(hf)
+                self.weights[internal] = self.backend["get_tensor"](hf)
         else:
-            raise RuntimeError("stream_layers set but no backend for on-demand load")
+            raise RuntimeError("no backend for on-demand load")
 
     def _release_layer(self, layer: int) -> None:
         if not self.stream_layers:
@@ -358,52 +288,34 @@ class HybridTransformer(torch.nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_ids, self.weights["token_embd.weight"])
 
-    def layer_forward(
-        self,
-        x: torch.Tensor,
-        layer: int,
-        positions: torch.Tensor,
-        use_optical: bool = True,
-    ) -> torch.Tensor:
+    def layer_forward(self, x, layer, positions, use_optical=True):
         self._ensure_layer(layer)
         cfg = self.cfg
         w = self.weights
         h = _rms_norm(x, w[f"blk.{layer}.attn_norm.weight"], cfg.rms_eps)
-
         q = (h.float() @ w[f"blk.{layer}.attn_q.weight"].float().T).to(dtype=x.dtype)
         k = (h.float() @ w[f"blk.{layer}.attn_k.weight"].float().T).to(dtype=x.dtype)
         v = (h.float() @ w[f"blk.{layer}.attn_v.weight"].float().T).to(dtype=x.dtype)
-
         b, s, _ = q.shape
         q = q.view(b, s, cfg.n_heads, cfg.head_dim).transpose(1, 2)
         k = k.view(b, s, cfg.n_kv_heads, cfg.head_dim).transpose(1, 2)
         v = v.view(b, s, cfg.n_kv_heads, cfg.head_dim).transpose(1, 2)
         q, k = _apply_rope(q, k, positions, cfg.rope_theta)
-
         if cfg.n_kv_heads != cfg.n_heads:
             rep = cfg.n_heads // cfg.n_kv_heads
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-
         scale = math.sqrt(cfg.head_dim)
-        scores_h = []
-        for hi in range(cfg.n_heads):
-            qh, kh = q[:, hi].float(), k[:, hi].float()
-            if use_optical:
-                if self.noise is None:
-                    sh = optical_scores(qh, kh)
-                else:
-                    sh = optical_scores_general(qh, kh, noise=self.noise)
-            else:
-                sh = (qh @ kh.transpose(-2, -1)) / scale
-            scores_h.append(sh)
-        scores = torch.stack(scores_h, dim=1)
+        qf, kf = q.float(), k.float()
+        if use_optical:
+            scores = optical_scores_multihead(qf, kf, noise=self.noise)
+        else:
+            scores = (qf @ kf.transpose(-2, -1)) / scale
         attn = torch.softmax(scores, dim=-1)
         out = attn @ v.float()
         out = out.transpose(1, 2).contiguous().view(b, s, cfg.n_heads * cfg.head_dim)
         out = (out @ w[f"blk.{layer}.attn_output.weight"].float().T).to(dtype=x.dtype)
         x = x + out
-
         h = _rms_norm(x, w[f"blk.{layer}.ffn_norm.weight"], cfg.rms_eps)
         gate = h.float() @ w[f"blk.{layer}.ffn_gate.weight"].float().T
         up = h.float() @ w[f"blk.{layer}.ffn_up.weight"].float().T
@@ -413,36 +325,23 @@ class HybridTransformer(torch.nn.Module):
         self._release_layer(layer)
         return x
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        use_optical: bool = True,
-    ) -> torch.Tensor:
+    def forward(self, input_ids, use_optical=True):
         x = self.embed(input_ids)
-        s = input_ids.shape[1]
-        positions = torch.arange(s, device=input_ids.device)
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         for layer in range(self.cfg.n_layers):
             x = self.layer_forward(x, layer, positions, use_optical=use_optical)
         x = _rms_norm(x, self.weights["output_norm.weight"], self.cfg.rms_eps)
-        logits = x.float() @ self.weights["output.weight"].float().T
-        return logits
+        return x.float() @ self.weights["output.weight"].float().T
 
     @torch.no_grad()
-    def generate(
-        self,
-        input_ids: list[int],
-        max_new_tokens: int = 16,
-        use_optical: bool = True,
-        temperature: float = 0.0,
-    ) -> list[int]:
+    def generate(self, input_ids, max_new_tokens=16, use_optical=True, temperature=0.0):
         ids = list(input_ids)
         for _ in range(max_new_tokens):
             t = torch.tensor([ids], dtype=torch.long)
             logits = self.forward(t, use_optical=use_optical)
             next_logits = logits[0, -1]
             if temperature and temperature > 0:
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_id = int(next_logits.argmax().item()) if not temperature else int(torch.multinomial(torch.softmax(next_logits / temperature, dim=-1), 1).item())
+                next_id = int(torch.multinomial(torch.softmax(next_logits / temperature, dim=-1), 1).item())
             else:
                 next_id = int(next_logits.argmax().item())
             ids.append(next_id)
