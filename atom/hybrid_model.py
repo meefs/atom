@@ -134,7 +134,6 @@ def _load_gguf_bundle(
         n_total += 1
     n_layers = n_total if max_layers is None else min(n_total, max_layers)
 
-    # Always load embed + head; layers either all or on demand
     shared_names = ["token_embd.weight", "output_norm.weight", "output.weight"]
     weights: dict = {}
     for name in shared_names:
@@ -145,7 +144,6 @@ def _load_gguf_bundle(
             for name in _gguf_layer_keys(i):
                 weights[name] = _gguf_dequant(name_to_tensor[name])
 
-    # Config from shapes (need layer 0 q/k/gate — load temporarily if streaming)
     if f"blk.0.attn_q.weight" in weights:
         q0 = weights["blk.0.attn_q.weight"]
         k0 = weights["blk.0.attn_k.weight"]
@@ -171,8 +169,6 @@ def _load_gguf_bundle(
     return weights, cfg, backend
 
 
-# ---- Hugging Face safetensors ----
-
 _HF_TO_INTERNAL = {
     "model.embed_tokens.weight": "token_embd.weight",
     "model.norm.weight": "output_norm.weight",
@@ -194,14 +190,6 @@ def _hf_layer_map(i: int) -> dict[str, str]:
     }
 
 
-def _load_safetensors_file(path: Path) -> dict[str, torch.Tensor]:
-    try:
-        from safetensors.torch import load_file
-    except ImportError as e:
-        raise ImportError("pip install safetensors") from e
-    return load_file(str(path))
-
-
 def _load_hf_bundle(
     path: Path,
     max_layers: int | None,
@@ -217,8 +205,6 @@ def _load_hf_bundle(
         if not files:
             raise FileNotFoundError(f"No .safetensors under {path}")
 
-    # Merge shards into a key index: key -> (file, tensor_name) without loading all
-    # Simplest reliable path: load only needed keys from each file
     all_keys: dict[str, Path] = {}
     for f in files:
         try:
@@ -236,7 +222,6 @@ def _load_hf_bundle(
         with safe_open(str(f), framework="pt", device="cpu") as sf:
             return _to_f16(sf.get_tensor(key))
 
-    # Count layers
     n_total = 0
     while f"model.layers.{n_total}.self_attn.q_proj.weight" in all_keys:
         n_total += 1
@@ -245,7 +230,6 @@ def _load_hf_bundle(
     weights: dict = {}
     for hf, internal in _HF_TO_INTERNAL.items():
         if hf not in all_keys:
-            # some models tie lm_head to embed
             if hf == "lm_head.weight" and "model.embed_tokens.weight" in all_keys:
                 weights[internal] = get_tensor("model.embed_tokens.weight")
                 continue
@@ -273,22 +257,33 @@ def _load_hf_bundle(
         else get_tensor("model.layers.0.mlp.gate_proj.weight")
     )
     emb = weights["token_embd.weight"]
-    head_dim = 128
+    cfg_path = root / "config.json"
+    meta = {}
+    if cfg_path.exists():
+        meta = json.loads(cfg_path.read_text())
+
+    if meta.get("num_attention_heads") and meta.get("hidden_size"):
+        n_heads = int(meta["num_attention_heads"])
+        n_kv_heads = int(meta.get("num_key_value_heads", n_heads))
+        head_dim = int(meta["hidden_size"]) // n_heads
+    else:
+        head_dim = 64 if q0.shape[0] % 64 == 0 and (q0.shape[0] // 64) <= 32 else 128
+        while head_dim > 8 and (q0.shape[0] % head_dim != 0 or k0.shape[0] % head_dim != 0):
+            head_dim //= 2
+        n_heads = q0.shape[0] // head_dim
+        n_kv_heads = k0.shape[0] // head_dim
+
     cfg = ModelConfig(
         n_layers=n_layers,
-        n_heads=q0.shape[0] // head_dim,
-        n_kv_heads=k0.shape[0] // head_dim,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
         head_dim=head_dim,
         hidden_size=emb.shape[1],
         intermediate_size=g0.shape[0],
         vocab_size=emb.shape[0],
         source="safetensors",
     )
-
-    # optional config.json rope / eps
-    cfg_path = root / "config.json"
-    if cfg_path.exists():
-        meta = json.loads(cfg_path.read_text())
+    if meta:
         cfg.rms_eps = float(meta.get("rms_norm_eps", cfg.rms_eps))
         cfg.rope_theta = float(meta.get("rope_theta", cfg.rope_theta))
 
@@ -447,12 +442,11 @@ class HybridTransformer(torch.nn.Module):
             next_logits = logits[0, -1]
             if temperature and temperature > 0:
                 probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_id = int(torch.multinomial(probs, 1).item())
+                next_id = int(next_logits.argmax().item()) if not temperature else int(torch.multinomial(torch.softmax(next_logits / temperature, dim=-1), 1).item())
             else:
                 next_id = int(next_logits.argmax().item())
             ids.append(next_id)
         return ids
 
 
-# Back-compat alias
 HybridMistralFromGGUF = HybridTransformer
